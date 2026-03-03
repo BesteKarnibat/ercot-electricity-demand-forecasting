@@ -1,0 +1,325 @@
+---
+title: "Weather Forecast"
+author: "Faith Lucy Kirabo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Libraries
+library(tidyverse)
+library(forecast)
+library(lubridate)
+```
+
+```{r}
+# Load raw, no mutations, no filtering
+train_raw <- read_csv("~/Downloads/ercot_full_dataset_2018_2025-2.csv",
+                      show_col_types = FALSE)
+
+# Basic structure
+cat("Total rows:", nrow(train_raw), "\n")
+cat("Columns:", ncol(train_raw), "\n")
+cat("Datetime class:", class(train_raw$datetime), "\n")
+
+# Raw datetime values, first and last 5
+cat("\nFirst 5 datetime values (raw):\n")
+print(head(train_raw$datetime, 5))
+cat("\nLast 5 datetime values (raw):\n")
+print(tail(train_raw$datetime, 5))
+
+# Row counts per year
+cat("\nRows per year:\n")
+train_raw %>%
+  mutate(year = str_sub(as.character(datetime), 1, 4)) %>%
+  count(year) %>%
+  print()
+
+# Any NAs in datetime
+cat("\nNA datetimes:", sum(is.na(train_raw$datetime)), "\n")
+
+# Check for duplicate datetimes
+cat("Duplicate datetimes:", sum(duplicated(train_raw$datetime)), "\n")
+```
+```{r}
+# Filter to training window only (2018-2023)
+train <- train_raw %>%
+  filter(datetime >= as.POSIXct("2018-01-01 00:00:00", tz = "UTC") &
+         datetime <= as.POSIXct("2023-12-31 23:00:00", tz = "UTC")) %>%
+  arrange(datetime)
+
+cat("Date range:", format(min(train$datetime)), "to", format(max(train$datetime)), "\n")
+cat("Rows:", nrow(train), "\n")
+
+# Confirm rows per year
+train %>%
+  mutate(year = year(datetime)) %>%
+  count(year)
+
+# Find the exact missing hours per year
+full_sequence <- tibble(
+  datetime = seq(as.POSIXct("2018-01-01 01:00:00", tz = "UTC"),
+                 as.POSIXct("2023-12-31 23:00:00", tz = "UTC"),
+                 by = "hour")
+)
+
+missing_hours <- full_sequence %>%
+  anti_join(train, by = "datetime")
+
+cat("\nMissing hours:", nrow(missing_hours), "\n")
+print(missing_hours)
+```
+
+```{r}
+cat("Date range:", format(min(train$datetime)), "to", format(max(train$datetime)), "\n")
+cat("Rows:", nrow(train), "| Expect 52,584 for 2018-2025\n")
+cat("Class:", class(train$datetime), "\n")
+
+cat("First 5 raw values:\n")
+print(head(train$datetime, 5))
+
+cat("Any NAs in datetime?", sum(is.na(train$datetime)), "\n")
+cat("Total rows:", nrow(train), "\n")
+```
+```{r}
+# Gap check
+gaps <- train %>%
+  mutate(gap = as.numeric(difftime(datetime, lag(datetime), units = "hours"))) %>%
+  filter(gap != 1 & !is.na(gap))
+
+cat("Gaps found:", nrow(gaps), "\n")
+print(head(gaps %>% select(datetime, gap), 10))
+```
+
+```{r}
+# Define weather variables to forecast
+zones <- c("COAST", "EAST", "FWEST", "NCENT", "NORTH", "SCENT", "SOUTH", "WEST")
+
+weather_vars <- c(
+  paste0(zones, "_temperature_f"),
+  paste0(zones, "_relative_humidity_pct"),
+  paste0(zones, "_wind_speed_mph"),
+  paste0(zones, "_solar_radiation_wm2")
+)
+
+h <- 8784 #2024
+```
+
+### Prediction Function
+```{r}
+# STL + SARIMA forecast
+# forecast daily with STL+ARIMA, then reattach hourly profile
+forecast_weather_series <- function(col_name, data, horizon_hours = 8760) {
+  
+  series <- data %>%
+    select(datetime, value = all_of(col_name)) %>%
+    filter(!is.na(value))
+  
+  # mean per day
+  daily <- series %>%
+    mutate(date = as_date(datetime)) %>%
+    group_by(date) %>%
+    summarise(daily_mean = mean(value, na.rm = TRUE), .groups = "drop")
+  
+  monthly_mean <- series %>%
+    mutate(month = month(datetime)) %>%
+    group_by(month) %>%
+    summarise(monthly_mean = mean(value, na.rm = TRUE), .groups = "drop")
+  
+  hourly_profile <- series %>%
+    mutate(month = month(datetime), hour = hour(datetime)) %>%
+    group_by(month, hour) %>%
+    summarise(profile_offset = mean(value, na.rm = TRUE), .groups = "drop") %>%
+    left_join(monthly_mean, by = "month") %>%
+    mutate(delta = profile_offset - monthly_mean)
+  
+  # msts (weekly and annual seasonality)
+  daily_ts <- msts(daily$daily_mean, seasonal.periods = c(7,365.25)) #weekly, leap and non leap
+  
+  #stl_fit  <- mstl(daily_ts, robust = TRUE)
+  #horizon_days <- ceiling(horizon_hours / 24)
+  #daily_fc <- forecast(stl_fit, h = horizon_days, method = "ets")
+  horizon_days <- ceiling(horizon_hours / 24)
+  daily_fc     <- stlf(daily_ts, h = horizon_days, method = "arima", robust = TRUE)
+  # Reconstruct hourly forecasts
+  
+  last_date <- max(daily$date)
+  
+  future_hourly <- tibble(
+    datetime = seq(as.POSIXct(last_date + days(1), tz = "UTC"), 
+                   by = "hour", 
+                   length.out = horizon_hours)
+  ) %>%
+    mutate(
+      date  = as_date(datetime),
+      month = month(datetime),
+      hour  = hour(datetime),
+      day_index = as.integer(date - last_date)
+    ) %>%
+    left_join(
+      tibble(day_index = 1:horizon_days, 
+             daily_fc_mean = as.numeric(daily_fc$mean)),
+      by = "day_index"
+    ) %>%
+    left_join(hourly_profile %>% select(month, hour, delta), 
+              by = c("month", "hour")) %>%
+    mutate(
+      forecast = daily_fc_mean + replace_na(delta, 0),
+      # hard floor for solar radiation (can't be negative)
+      forecast = if_else(str_detect(col_name, "solar") & forecast < 0, 0, forecast)
+    )
+  
+  future_hourly %>% select(datetime, forecast) %>% rename(!!col_name := forecast)
+}
+```
+
+```{r}
+# Run for all 32 series
+weather_forecasts_2024 <- map(weather_vars, function(v) {
+  cat("-", v, "\n")
+  forecast_weather_series(v, train, horizon_hours = h)
+}) %>%
+  reduce(left_join, by = "datetime")
+```
+
+```{r}
+# actual 2024 weather
+weather_actual_2024 <- train_raw %>%
+  filter(datetime >= as.POSIXct("2024-01-01 00:00:00", tz = "UTC") &
+         datetime <= as.POSIXct("2024-12-31 23:00:00", tz = "UTC")) %>%
+  select(datetime, all_of(weather_vars))
+```
+
+### Assess model accuracy and finetune
+```{r}
+# Compute metrics for all 32 series
+weather_metrics <- map_dfr(weather_vars, function(v) {
+  pred   <- weather_forecasts_2024[[v]]
+  actual <- weather_actual_2024[[v]]
+  
+  tibble(
+    variable = v,
+    MAE      = mean(abs(pred - actual), na.rm = TRUE),
+    RMSE     = sqrt(mean((pred - actual)^2, na.rm = TRUE)),
+    MAPE     = mean(abs((pred - actual) / actual) * 100, na.rm = TRUE)
+  )
+})
+
+print(weather_metrics, n= 32)
+```
+
+# Investigating COAST prediction poor performance
+```{r}
+# COAST temperature predicted vs actual
+coast_comparison <- weather_forecasts_2024 %>%
+  select(datetime, pred = COAST_temperature_f) %>%
+  inner_join(
+    weather_actual_2024 %>% select(datetime, actual = COAST_temperature_f),
+    by = "datetime"
+  ) %>%
+  mutate(month = month(datetime),
+         error = pred - actual)
+
+# Error by month
+coast_comparison %>%
+  group_by(month) %>%
+  summarise(MAE = mean(abs(error)), bias = mean(error)) %>%
+  print()
+```
+
+### Forecast 2025 using 2018-2024
+```{r}
+# 2018-2024 training data
+weather_train_final <- train_raw %>%
+  filter(datetime >= as.POSIXct("2018-01-01 00:00:00", tz = "UTC") &
+         datetime <= as.POSIXct("2024-12-31 23:00:00", tz = "UTC")) %>%
+  arrange(datetime)
+
+cat("Final weather train rows:", nrow(weather_train_final), "| Expected: 61,368\n")
+
+# 2025 8760 hours
+h_2025 <- 8760
+
+weather_forecasts_2025 <- map(weather_vars, function(v) {
+  cat( v, "\n")
+  forecast_weather_series(v, weather_train_final, horizon_hours = h_2025)
+}) %>%
+  reduce(left_join, by = "datetime")
+
+cat("Rows:", nrow(weather_forecasts_2025), "| Expected: 8760\n")
+```
+
+```{r}
+weather_forecasts_2025 <- weather_forecasts_2025 %>%
+  mutate(
+    # Datetime features
+    hour        = hour(datetime),
+    day_of_week = wday(datetime, week_start = 1) - 1,  # 0=Mon, 6=Sun
+    month       = month(datetime),
+    year        = year(datetime),
+    is_weekend  = if_else(day_of_week >= 5, 1, 0),
+    
+    # Cyclical encodings
+    hour_sin    = sin(2 * pi * hour / 24),
+    hour_cos    = cos(2 * pi * hour / 24),
+    month_sin   = sin(2 * pi * month / 12),
+    month_cos   = cos(2 * pi * month / 12),
+    dow_sin     = sin(2 * pi * day_of_week / 7),
+    dow_cos     = cos(2 * pi * day_of_week / 7),
+    
+    # Holidays (Texas public holidays)
+    is_holiday  = if_else(as_date(datetime) %in% as_date(c(
+      "2025-01-01", "2025-01-20", "2025-02-17", "2025-05-26",
+      "2025-06-19", "2025-07-04", "2025-09-01", "2025-11-11",
+      "2025-11-27", "2025-12-25"
+    )), 1, 0)
+  )
+
+# Heat index (derived from forecasted temp + humidity)
+compute_heat_index <- function(temp_f, rh) {
+  hi <- -42.379 +
+        (2.04901523  * temp_f) +
+        (10.14333127 * rh) +
+        (-0.22475541 * temp_f * rh) +
+        (-0.00683783 * temp_f^2) +
+        (-0.05481717 * rh^2) +
+        (0.00122874  * temp_f^2 * rh) +
+        (0.00085282  * temp_f * rh^2) +
+        (-0.00000199 * temp_f^2 * rh^2)
+  if_else(temp_f >= 80, hi, temp_f)
+}
+
+for (zone in zones) {
+  weather_forecasts_2025 <- weather_forecasts_2025 %>%
+    mutate(!!paste0(zone, "_heat_index_f") := compute_heat_index(
+      .data[[paste0(zone, "_temperature_f")]],
+      .data[[paste0(zone, "_relative_humidity_pct")]]
+    ))
+}
+
+# Temperature lag (lag_24h from forecasted temps) 
+# Use last 24 hours of 2024 actual data as seed for lag
+temp_seed <- weather_train_final %>%
+  arrange(datetime) %>%
+  tail(24) %>%
+  select(datetime, all_of(paste0(zones, "_temperature_f")))
+
+# Compute temp_lag_24h — for 2025 this is the previous hour's temperature
+weather_forecasts_2025 <- weather_forecasts_2025 %>%
+  mutate(temp_lag_24h = lag(COAST_temperature_f, 24))
+# Note: first 24 rows will be NA — fill from seed
+weather_forecasts_2025$temp_lag_24h[1:24] <- temp_seed$COAST_temperature_f
+```
+
+
+```{r}
+write_csv(weather_forecasts_2025,
+          "~/Desktop/MSADS Courses/Time Series/Final_Project/data/test_ercot_weather_forecasts_2025.csv")
+cat("Rows:", nrow(weather_forecasts), "| Cols:", ncol(weather_forecasts), "\n")
+```
+
+

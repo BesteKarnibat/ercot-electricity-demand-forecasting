@@ -80,4 +80,4 @@ Three parallel modeling architectures were evaluated:
 * Beste 
 
 
-* Olivia Yang 
+* [Olivia Yang](https://www.linkedin.com/in/xiaoyu-yang-8a4878243/) 
